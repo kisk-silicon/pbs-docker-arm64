@@ -1,0 +1,169 @@
+name: Build ARM64 Docker Images
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # 6時間ごとにチェック
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'イメージが既に存在しても強制的に再ビルドする'
+        type: boolean
+        default: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # wofferl/proxmox-backup-arm64 の最新リリースをチェックし、
+  # 未ビルドのものだけビルドジョブに渡す
+  # ─────────────────────────────────────────────────────────────────────────────
+  check-releases:
+    name: Check for new releases
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+      has_builds: ${{ steps.check.outputs.has_builds }}
+
+    steps:
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check releases and build matrix
+        id: check
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          IMAGE_REPO: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          RELEASES=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/wofferl/proxmox-backup-arm64/releases?per_page=30")
+
+          MATRIX_INCLUDES=()
+
+          for DISTRO in trixie bookworm; do
+            DISTRO_CAP="${DISTRO^}"
+
+            # リリース名に distro 名が含まれるものを取得（最新1件）
+            RELEASE=$(echo "$RELEASES" | \
+              jq -r --arg d "$DISTRO_CAP" \
+              '[.[] | select(.name | test($d; "i"))] | first // empty')
+
+            if [ -z "$RELEASE" ]; then
+              echo "::notice::No $DISTRO release found – skipping"
+              continue
+            fi
+
+            VERSION=$(echo "$RELEASE" | jq -r '.tag_name')
+            echo "Found $DISTRO release: $VERSION"
+
+            IMAGE="${IMAGE_REPO}:${VERSION}-${DISTRO}"
+
+            if [ "${FORCE_REBUILD}" != "true" ]; then
+              if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+                echo "::notice::$IMAGE already exists – skipping"
+                continue
+              fi
+            fi
+
+            # dbgsym パッケージを除く .deb ファイルのみ取得
+            ASSETS=$(echo "$RELEASE" | jq -c \
+              '[.assets[]
+                | select(.name | endswith(".deb"))
+                | select(.name | test("dbgsym") | not)
+                | {name: .name, url: .browser_download_url}]')
+
+            ITEM=$(jq -cn \
+              --arg version "$VERSION" \
+              --arg debian "$DISTRO" \
+              --argjson assets "$ASSETS" \
+              '{version: $version, debian: $debian, assets: $assets}')
+
+            MATRIX_INCLUDES+=("$ITEM")
+          done
+
+          if [ ${#MATRIX_INCLUDES[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has_builds=false"        >> "$GITHUB_OUTPUT"
+          else
+            MATRIX_JSON=$(printf '%s\n' "${MATRIX_INCLUDES[@]}" | jq -sc '{include: .}')
+            echo "matrix=$(echo "$MATRIX_JSON" | jq -c '.')" >> "$GITHUB_OUTPUT"
+            echo "has_builds=true"                            >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ARM64 ネイティブランナーで Docker イメージをビルドして ghcr.io にプッシュ
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.version }}-${{ matrix.debian }}
+    needs: check-releases
+    if: needs.check-releases.outputs.has_builds == 'true'
+    runs-on: ubuntu-24.04-arm  # GitHub ホスト型 ARM64 ランナー
+    strategy:
+      matrix: ${{ fromJson(needs.check-releases.outputs.matrix) }}
+      fail-fast: false
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # wofferl のリリースから deb パッケージをダウンロード
+      - name: Download deb packages
+        run: |
+          mkdir -p docker/debs
+          echo '${{ toJson(matrix.assets) }}' \
+            | jq -r '.[] | "\(.name) \(.url)"' \
+            | while read -r name url; do
+                echo "Downloading $name ..."
+                curl -fsSL -o "docker/debs/$name" "$url"
+              done
+          echo "--- Downloaded packages ---"
+          ls -lh docker/debs/
+
+      # ghcr.io に付与するタグを決定
+      # 例: 4.1.5-2-trixie, latest-trixie
+      - name: Determine image tags
+        id: tags
+        run: |
+          VERSION="${{ matrix.version }}"
+          DISTRO="${{ matrix.debian }}"
+          BASE="ghcr.io/${{ github.repository }}"
+
+          TAGS="${BASE}:${VERSION}-${DISTRO},${BASE}:latest-${DISTRO}"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Image tags: $TAGS"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            DEBIAN_VERSION=${{ matrix.debian }}
+            PBS_VERSION=${{ matrix.version }}
+          cache-from: type=gha,scope=${{ matrix.debian }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.debian }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.version }}
+            org.opencontainers.image.description=Proxmox Backup Server ${{ matrix.version }} (Debian ${{ matrix.debian }}) for ARM64
