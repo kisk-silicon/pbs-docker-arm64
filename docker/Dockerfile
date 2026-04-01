@@ -34,13 +34,25 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # ── 2. wofferl の arm64 deb パッケージをインストール ───────────────────────
-#   ビルド時に docker/debs/ へダウンロード済みのパッケージを COPY して投入する。
-#   dpkg -i で先に展開し、不足依存は apt-get -f で apt から補完する。
+#   ダウンロード済みの deb からローカル apt リポジトリを作成し、
+#   Proxmox オンラインリポジトリと合わせて apt に依存関係を一括解決させる。
+#   (dpkg -i + apt-get -f では apt がローカル deb 間の依存を認識できず、
+#    解決不能と判断したパッケージを削除して rc 状態にしてしまうため使用しない)
 COPY debs/ /tmp/debs/
 
-RUN dpkg -i /tmp/debs/*.deb 2>&1 | grep -v "^dpkg-deb:" || true && \
-    apt-get install -f -y --no-install-recommends && \
-    rm -rf /tmp/debs /var/lib/apt/lists/*
+RUN apt-get install -y --no-install-recommends dpkg-dev \
+    && cd /tmp/debs \
+    # ローカルリポジトリの Packages インデックスを生成
+    && dpkg-scanpackages -m . > Packages \
+    && echo "deb [trusted=yes] file:///tmp/debs ./" \
+         > /etc/apt/sources.list.d/local-debs.list \
+    && apt-get update \
+    # arm64 バイナリは local-debs から、arch:all の Perl/JS 等は Proxmox リポジトリから解決
+    && apt-get install -y --no-install-recommends proxmox-backup-server \
+    # 作業用パッケージとローカルリポジトリ設定を削除
+    && apt-get purge -y --autoremove dpkg-dev \
+    && rm -f /etc/apt/sources.list.d/local-debs.list \
+    && rm -rf /tmp/debs /var/lib/apt/lists/*
 
 # ── 3. 実行環境の準備 ───────────────────────────────────────────────────────
 RUN mkdir -p \
